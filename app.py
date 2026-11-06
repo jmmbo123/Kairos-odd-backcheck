@@ -7,11 +7,12 @@ from collections import Counter
 
 st.set_page_config(
     page_title="Kairos Odds Scanner",
-    page_icon="⚽"
+    page_icon="⚽",
+    layout="wide"
 )
 
 st.title("⚽ KAIROS ODDS SCANNER")
-st.caption("Soccer | Over/Under buts | Pré-match")
+st.caption("Soccer | Over/Under buts | Matchs à venir")
 
 target = st.number_input(
     "Cote exacte recherchée",
@@ -21,41 +22,42 @@ target = st.number_input(
     format="%.2f"
 )
 
+tolerance = st.selectbox(
+    "Tolérance de recherche",
+    ["Exacte", "±0.01", "±0.05"],
+    index=0
+)
+
+period = st.selectbox(
+    "Période",
+    ["Aujourd'hui", "Prochaines 24 heures", "7 prochains jours"]
+)
+
 if st.button("🔎 SCANNER", use_container_width=True):
     with st.spinner("Analyse des cotes en cours..."):
         try:
-            url = "https://moviodds.com/odds?sport=soccer"
-            response = requests.get(url, timeout=45)
+            response = requests.get(
+                "https://moviodds.com/odds?sport=soccer",
+                timeout=45
+            )
             response.raise_for_status()
             data = response.json()
 
-            now = datetime.now(
-                ZoneInfo("America/Toronto")
-            )
-
+            now = datetime.now(ZoneInfo("America/Toronto"))
             matches = data.get("matches", [])
-            phases = Counter()
-            groups = Counter()
-            future_phases = Counter()
-            future_groups = Counter()
 
             results = []
             future_count = 0
-            quote_count = 0
+            examined = 0
+            phases = Counter()
+            markets = Counter()
 
-            # Diagnostic global
-            for match in matches:
-                for quote in match.get("quotes", []):
-                    phase = str(
-                        quote.get("phase", "ABSENT")
-                    )
-                    group = str(
-                        quote.get("group_name", "ABSENT")
-                    )
-                    phases[phase] += 1
-                    groups[group] += 1
+            margin = {
+                "Exacte": 0.0001,
+                "±0.01": 0.010001,
+                "±0.05": 0.050001
+            }[tolerance]
 
-            # Analyse des matchs futurs
             for match in matches:
                 kickoff = match.get("kickoff_utc")
 
@@ -68,14 +70,23 @@ if st.button("🔎 SCANNER", use_container_width=True):
                     ).astimezone(
                         ZoneInfo("America/Toronto")
                     )
-                except (ValueError, TypeError):
-                    continue
-
-                if start.date() != now.date():
+                except (ValueError, TypeError, AttributeError):
                     continue
 
                 if start <= now:
                     continue
+
+                if period == "Aujourd'hui":
+                    if start.date() != now.date():
+                        continue
+
+                elif period == "Prochaines 24 heures":
+                    if (start - now).total_seconds() > 86400:
+                        continue
+
+                elif period == "7 prochains jours":
+                    if (start - now).total_seconds() > 604800:
+                        continue
 
                 if match.get("in_play") is True:
                     continue
@@ -83,57 +94,80 @@ if st.button("🔎 SCANNER", use_container_width=True):
                 future_count += 1
 
                 for quote in match.get("quotes", []):
-                    quote_count += 1
+                    examined += 1
 
                     phase = str(
-                        quote.get("phase", "ABSENT")
-                    ).lower()
+                        quote.get("phase") or "absent"
+                    ).lower().strip()
 
                     market = str(
-                        quote.get("group_name", "")
+                        quote.get("group_name") or ""
                     )
 
-                    future_phases[phase] += 1
-                    future_groups[market] += 1
+                    phases[phase] += 1
+                    markets[market] += 1
 
-                    # Exclure les cotes en direct
+                    # Exclure les cotes identifiees en direct
                     if phase in (
                         "inplay",
                         "in_play",
+                        "in-play",
                         "live"
                     ):
                         continue
 
-                    # Accepter uniquement le pré-match
+                    # Accepter les phases pre-match
+                    # ainsi que les phases absentes.
                     if phase not in (
                         "prematch",
                         "pre_match",
                         "pre-match",
-                        "pre"
+                        "pre",
+                        "absent"
                     ):
                         continue
 
                     name = market.lower()
 
-                    # Over/Under de buts uniquement
-                    goal_market = (
-                        "over/under" in name
-                        or "total goals" in name
-                        or "total buts" in name
-                        or "goal line" in name
+                    # Marches de total de buts
+                    goal_market = any(
+                        word in name
+                        for word in (
+                            "over/under",
+                            "total goals",
+                            "total buts",
+                            "goal line",
+                            "match goals",
+                            "1st half goals",
+                            "2nd half goals"
+                        )
                     )
 
                     if not goal_market:
                         continue
 
-                    odd = quote.get("odds_dec")
+                    label = str(
+                        quote.get("label") or ""
+                    )
+
+                    # Garder uniquement les selections
+                    # clairement Over ou Under.
+                    label_lower = label.lower().strip()
+
+                    if not (
+                        label_lower.startswith("over")
+                        or label_lower.startswith("under")
+                        or label_lower.startswith("o ")
+                        or label_lower.startswith("u ")
+                    ):
+                        continue
 
                     try:
-                        if abs(
-                            float(odd) - target
-                        ) > 0.0001:
-                            continue
+                        odd = float(quote.get("odds_dec"))
                     except (ValueError, TypeError):
+                        continue
+
+                    if abs(odd - target) > margin:
                         continue
 
                     results.append({
@@ -141,36 +175,32 @@ if st.button("🔎 SCANNER", use_container_width=True):
                             f"{match.get('home', '?')} vs "
                             f"{match.get('away', '?')}"
                         ),
-                        "Ligue": match.get(
-                            "league", ""
-                        ),
-                        "Heure": start.strftime(
-                            "%H:%M"
-                        ),
-                        "Marché": market,
-                        "Sélection": quote.get(
-                            "label", ""
-                        ),
-                        "Cote": float(odd)
+                        "Ligue": match.get("league", ""),
+                        "Date": start.strftime("%d/%m/%Y"),
+                        "Heure": start.strftime("%H:%M"),
+                        "Marche": market,
+                        "Selection": label,
+                        "Cote": odd,
+                        "Phase": phase
                     })
 
-            st.success("Analyse terminée !")
+            st.success("Analyse terminee !")
 
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
 
-            with col1:
-                st.metric(
-                    "Matchs futurs",
-                    future_count
-                )
-
-            with col2:
-                st.metric(
-                    "Cotes trouvées",
-                    len(results)
-                )
+            col1.metric("Matchs futurs", future_count)
+            col2.metric("Cotes examinees", examined)
+            col3.metric("Cotes trouvees", len(results))
 
             if results:
+                results.sort(
+                    key=lambda x: (
+                        x["Date"],
+                        x["Heure"],
+                        x["Match"]
+                    )
+                )
+
                 st.dataframe(
                     results,
                     use_container_width=True,
@@ -178,50 +208,33 @@ if st.button("🔎 SCANNER", use_container_width=True):
                 )
             else:
                 st.warning(
-                    "Aucune cote correspondante trouvée."
+                    "Aucune cote correspondante trouvee."
                 )
 
             st.divider()
             st.subheader("🔧 DIAGNOSTIC API")
 
-            st.write(
-                "Nombre total de matchs :",
-                len(matches)
-            )
+            st.write("Nombre total de matchs :", len(matches))
+            st.write("Matchs futurs analyses :", future_count)
+            st.write("Cotes examinees :", examined)
 
-            st.write(
-                "Cotes examinées sur les matchs futurs :",
-                quote_count
-            )
+            with st.expander("PHASES DES COTES"):
+                st.json(dict(phases))
 
-            st.write("PHASES DISPONIBLES :")
-            st.json(dict(phases))
-
-            st.write("PHASES DES MATCHS FUTURS :")
-            st.json(dict(future_phases))
-
-            with st.expander(
-                "MARCHÉS DISPONIBLES"
-            ):
-                st.json(dict(groups))
-
-            with st.expander(
-                "MARCHÉS DES MATCHS FUTURS"
-            ):
-                st.json(dict(future_groups))
+            with st.expander("MARCHES DISPONIBLES"):
+                st.json(dict(markets))
 
             st.caption(
                 "Source : MoviOdds. "
-                "La provenance Bet365 des cotes "
-                "n'est pas encore vérifiée."
+                "Les cotes sans phase sont acceptees "
+                "uniquement pour les matchs futurs "
+                "non signales en direct. "
+                "Cela ne garantit pas leur statut pre-match. "
+                "La provenance Bet365 reste non verifiee."
             )
 
         except requests.RequestException as e:
-            st.error(
-                f"Erreur de connexion à l'API : {e}"
-            )
+            st.error(f"Erreur API : {e}")
 
-        except (ValueError, TypeError) as e:
-            st.error(
-                f"Erreur de lecture des données : {e}"
-            )
+        except (ValueError, TypeError, KeyError) as e:
+            st.error(f"Erreur de donnees : {e}")
