@@ -12,7 +12,7 @@ st.set_page_config(
 )
 
 st.title("⚽ KAIROS ODDS SCANNER")
-st.caption("Soccer | Over/Under buts | Matchs à venir")
+st.caption("Soccer | Over/Under buts | Pré-match")
 
 target = st.number_input(
     "Cote exacte recherchée",
@@ -22,43 +22,62 @@ target = st.number_input(
     format="%.2f"
 )
 
-tolerance = st.selectbox(
-    "Tolérance de recherche",
-    ["Exacte", "±0.01", "±0.05"],
-    index=0
-)
-
-period = st.selectbox(
-    "Période",
-    ["Aujourd'hui", "Prochaines 24 heures", "7 prochains jours"]
+MARKETS = (
+    "goals over/under",
+    "goal line",
+    "total goals",
+    "total buts",
+    "over/under"
 )
 
 if st.button("🔎 SCANNER", use_container_width=True):
+
     with st.spinner("Analyse des cotes en cours..."):
+
         try:
+            url = "https://moviodds.com/odds?sport=soccer"
+
             response = requests.get(
-                "https://moviodds.com/odds?sport=soccer",
-                timeout=45
+                url,
+                timeout=45,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json"
+                }
             )
+
             response.raise_for_status()
             data = response.json()
 
-            now = datetime.now(ZoneInfo("America/Toronto"))
+            if not isinstance(data, dict):
+                st.error("Format API inattendu.")
+                st.stop()
+
             matches = data.get("matches", [])
+
+            if not isinstance(matches, list):
+                st.error("Liste des matchs invalide.")
+                st.stop()
+
+            now = datetime.now(
+                ZoneInfo("America/Toronto")
+            )
 
             results = []
             future_count = 0
-            examined = 0
+            quote_count = 0
+
             phases = Counter()
             markets = Counter()
 
-            margin = {
-                "Exacte": 0.0001,
-                "±0.01": 0.010001,
-                "±0.05": 0.050001
-            }[tolerance]
+            example = None
+            exact_examples = []
 
             for match in matches:
+
+                if not isinstance(match, dict):
+                    continue
+
                 kickoff = match.get("kickoff_utc")
 
                 if not kickoff:
@@ -66,39 +85,41 @@ if st.button("🔎 SCANNER", use_container_width=True):
 
                 try:
                     start = datetime.fromisoformat(
-                        kickoff.replace("Z", "+00:00")
+                        str(kickoff).replace(
+                            "Z", "+00:00"
+                        )
                     ).astimezone(
                         ZoneInfo("America/Toronto")
                     )
-                except (ValueError, TypeError, AttributeError):
+                except (ValueError, TypeError):
+                    continue
+
+                if start.date() != now.date():
                     continue
 
                 if start <= now:
                     continue
-
-                if period == "Aujourd'hui":
-                    if start.date() != now.date():
-                        continue
-
-                elif period == "Prochaines 24 heures":
-                    if (start - now).total_seconds() > 86400:
-                        continue
-
-                elif period == "7 prochains jours":
-                    if (start - now).total_seconds() > 604800:
-                        continue
 
                 if match.get("in_play") is True:
                     continue
 
                 future_count += 1
 
-                for quote in match.get("quotes", []):
-                    examined += 1
+                quotes = match.get("quotes", [])
+
+                if not isinstance(quotes, list):
+                    continue
+
+                for quote in quotes:
+
+                    if not isinstance(quote, dict):
+                        continue
+
+                    quote_count += 1
 
                     phase = str(
                         quote.get("phase") or "absent"
-                    ).lower().strip()
+                    ).lower()
 
                     market = str(
                         quote.get("group_name") or ""
@@ -107,17 +128,37 @@ if st.button("🔎 SCANNER", use_container_width=True):
                     phases[phase] += 1
                     markets[market] += 1
 
-                    # Exclure les cotes identifiees en direct
+                    name = market.lower()
+
+                    goal_market = any(
+                        keyword in name
+                        for keyword in MARKETS
+                    )
+
+                    if not goal_market:
+                        continue
+
+                    if example is None:
+                        example = {
+                            "match": (
+                                f"{match.get('home', '?')} vs "
+                                f"{match.get('away', '?')}"
+                            ),
+                            "kickoff": kickoff,
+                            "quote": quote
+                        }
+
+                    # Exclure les phases en direct
                     if phase in (
                         "inplay",
                         "in_play",
-                        "in-play",
                         "live"
                     ):
                         continue
 
-                    # Accepter les phases pre-match
-                    # ainsi que les phases absentes.
+                    # Accepter les phases connues
+                    # et les phases absentes,
+                    # sans garantir le statut pré-match.
                     if phase not in (
                         "prematch",
                         "pre_match",
@@ -127,80 +168,60 @@ if st.button("🔎 SCANNER", use_container_width=True):
                     ):
                         continue
 
-                    name = market.lower()
-
-                    # Marches de total de buts
-                    goal_market = any(
-                        word in name
-                        for word in (
-                            "over/under",
-                            "total goals",
-                            "total buts",
-                            "goal line",
-                            "match goals",
-                            "1st half goals",
-                            "2nd half goals"
-                        )
-                    )
-
-                    if not goal_market:
-                        continue
-
-                    label = str(
-                        quote.get("label") or ""
-                    )
-
-                    # Garder uniquement les selections
-                    # clairement Over ou Under.
-                    label_lower = label.lower().strip()
-
-                    if not (
-                        label_lower.startswith("over")
-                        or label_lower.startswith("under")
-                        or label_lower.startswith("o ")
-                        or label_lower.startswith("u ")
-                    ):
-                        continue
+                    odd = quote.get("odds_dec")
 
                     try:
-                        odd = float(quote.get("odds_dec"))
+                        odd = float(odd)
                     except (ValueError, TypeError):
                         continue
 
-                    if abs(odd - target) > margin:
+                    if round(odd, 2) != round(target, 2):
                         continue
 
-                    results.append({
+                    item = {
                         "Match": (
                             f"{match.get('home', '?')} vs "
                             f"{match.get('away', '?')}"
                         ),
                         "Ligue": match.get("league", ""),
-                        "Date": start.strftime("%d/%m/%Y"),
                         "Heure": start.strftime("%H:%M"),
-                        "Marche": market,
-                        "Selection": label,
+                        "Marché": market,
+                        "Sélection": quote.get("label", ""),
                         "Cote": odd,
                         "Phase": phase
-                    })
+                    }
 
-            st.success("Analyse terminee !")
+                    results.append(item)
+
+                    if len(exact_examples) < 3:
+                        exact_examples.append({
+                            "match": item["Match"],
+                            "quote": quote
+                        })
+
+            st.success("Analyse terminée !")
 
             col1, col2, col3 = st.columns(3)
 
-            col1.metric("Matchs futurs", future_count)
-            col2.metric("Cotes examinees", examined)
-            col3.metric("Cotes trouvees", len(results))
-
-            if results:
-                results.sort(
-                    key=lambda x: (
-                        x["Date"],
-                        x["Heure"],
-                        x["Match"]
-                    )
+            with col1:
+                st.metric(
+                    "Matchs futurs",
+                    future_count
                 )
 
+            with col2:
+                st.metric(
+                    "Cotes examinées",
+                    quote_count
+                )
+
+            with col3:
+                st.metric(
+                    "Cotes trouvées",
+                    len(results)
+                )
+
+            if results:
                 st.dataframe(
                     results,
                     use_container_width=True,
@@ -208,33 +229,69 @@ if st.button("🔎 SCANNER", use_container_width=True):
                 )
             else:
                 st.warning(
-                    "Aucune cote correspondante trouvee."
+                    "Aucune cote correspondante trouvée."
                 )
 
             st.divider()
+
+            st.subheader("🔍 EXEMPLE DE COTE RÉELLE")
+
+            if example:
+                st.json(example)
+            else:
+                st.warning(
+                    "Aucun exemple de marché "
+                    "Over/Under trouvé."
+                )
+
+            st.subheader("🎯 EXEMPLES DE COTES EXACTES")
+
+            if exact_examples:
+                st.json(exact_examples)
+            else:
+                st.info(
+                    "Aucun exemple exact avec "
+                    "le champ odds_dec."
+                )
+
+            st.divider()
+
             st.subheader("🔧 DIAGNOSTIC API")
 
-            st.write("Nombre total de matchs :", len(matches))
-            st.write("Matchs futurs analyses :", future_count)
-            st.write("Cotes examinees :", examined)
+            st.write(
+                "Nombre total de matchs :",
+                len(matches)
+            )
+
+            st.write(
+                "Matchs futurs analysés :",
+                future_count
+            )
+
+            st.write(
+                "Cotes examinées :",
+                quote_count
+            )
 
             with st.expander("PHASES DES COTES"):
                 st.json(dict(phases))
 
-            with st.expander("MARCHES DISPONIBLES"):
+            with st.expander("MARCHÉS DISPONIBLES"):
                 st.json(dict(markets))
 
             st.caption(
                 "Source : MoviOdds. "
-                "Les cotes sans phase sont acceptees "
-                "uniquement pour les matchs futurs "
-                "non signales en direct. "
-                "Cela ne garantit pas leur statut pre-match. "
-                "La provenance Bet365 reste non verifiee."
+                "Les phases absentes ne permettent pas "
+                "de confirmer le statut pré-match. "
+                "La provenance Bet365 n'est pas vérifiée."
             )
 
         except requests.RequestException as e:
-            st.error(f"Erreur API : {e}")
+            st.error(
+                f"Erreur de connexion API : {e}"
+            )
 
-        except (ValueError, TypeError, KeyError) as e:
-            st.error(f"Erreur de donnees : {e}")
+        except (ValueError, TypeError) as e:
+            st.error(
+                f"Erreur de lecture des données : {e}"
+            )
