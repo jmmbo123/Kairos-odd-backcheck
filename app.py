@@ -102,4 +102,3 @@ if st.button("🔎 SCANNER", use_container_width=True):
                 )
 
         except Exception as e:
-            st.error(f"Erreur de connexion : {e}")
