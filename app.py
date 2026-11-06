@@ -1,7 +1,7 @@
 
 import csv
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
@@ -22,17 +22,16 @@ ALLOWED_MARKETS = {
 
 LIVE_PHASES = {"inplay", "in_play", "in-play", "live"}
 PAGE_SIZE = 15
+CENT = Decimal("0.01")
 
 st.set_page_config(
-    page_title="KAIROS Odds Scanner",
+    page_title="KAIROS Odds Scanner 2.0",
     page_icon="⚽",
     layout="wide"
 )
 
-st.title("⚽ KAIROS ODDS SCANNER")
-st.caption(
-    "Soccer | Over/Under du match complet | Heures du Québec"
-)
+st.title("⚽ KAIROS ODDS SCANNER 2.0")
+st.caption("Soccer | Over/Under du match complet | Heure du Québec")
 
 
 def decimal_odd(value):
@@ -43,11 +42,8 @@ def decimal_odd(value):
         return None
 
 
-def display_odd(value):
-    return value.quantize(
-        Decimal("0.01"),
-        rounding=ROUND_HALF_UP
-    )
+def rounded_odd(number):
+    return number.quantize(CENT, rounding=ROUND_HALF_UP)
 
 
 def parse_kickoff(value):
@@ -58,7 +54,7 @@ def parse_kickoff(value):
             value.replace("Z", "+00:00")
         )
         return result.astimezone(TZ) if result.tzinfo else None
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
@@ -90,18 +86,21 @@ def fetch_matches():
     if not isinstance(payload, dict) or not isinstance(
         payload.get("matches"), list
     ):
-        raise ValueError(
-            "Format de réponse inattendu de MoviOdds."
-        )
+        raise ValueError("Format de réponse inattendu de MoviOdds.")
 
     return payload["matches"]
 
 
-def scan_matches(matches, target):
+def scan_matches(matches, target, tolerance, days):
     now = datetime.now(TZ)
+    accepted_dates = {
+        now.date() + timedelta(days=i) for i in days
+    }
+
     results = []
-    future_count = 0
     seen = set()
+    future_count = 0
+    eligible_quotes = 0
 
     for match in matches:
         if not isinstance(match, dict):
@@ -111,8 +110,8 @@ def scan_matches(matches, target):
 
         if (
             kickoff is None
-            or kickoff.date() != now.date()
             or kickoff <= now
+            or kickoff.date() not in accepted_dates
         ):
             continue
 
@@ -124,8 +123,8 @@ def scan_matches(matches, target):
         home = str(match.get("home") or "?")
         away = str(match.get("away") or "?")
         league = str(match.get("league") or "")
-        quotes = match.get("quotes") or []
 
+        quotes = match.get("quotes") or []
         if not isinstance(quotes, list):
             continue
 
@@ -150,11 +149,13 @@ def scan_matches(matches, target):
             selection = selection_from_quote(quote)
             odd = decimal_odd(quote.get("odds_dec"))
 
-            if (
-                selection is None
-                or odd is None
-                or display_odd(odd) != target
-            ):
+            if selection is None or odd is None:
+                continue
+
+            eligible_quotes += 1
+            shown = rounded_odd(odd)
+
+            if abs(shown - target) > tolerance:
                 continue
 
             key = (
@@ -163,7 +164,7 @@ def scan_matches(matches, target):
                 kickoff.isoformat(),
                 market.lower(),
                 selection,
-                str(target)
+                str(shown)
             )
 
             if key in seen:
@@ -174,59 +175,109 @@ def scan_matches(matches, target):
             results.append({
                 "Match": f"{home} vs {away}",
                 "Ligue": league,
+                "Date": kickoff.strftime("%d/%m/%Y"),
                 "Heure (QC)": kickoff.strftime("%H:%M"),
                 "Marché": market,
                 "Sélection": selection,
-                "Cote": f"{display_odd(odd):.2f}",
+                "Cote": f"{shown:.2f}",
+                "Correspondance": (
+                    "Exacte" if shown == target else "Proche"
+                ),
+                "Écart": f"{shown - target:+.2f}",
             })
 
     results.sort(
         key=lambda r: (
+            datetime.strptime(r["Date"], "%d/%m/%Y"),
             r["Heure (QC)"],
             r["Match"],
             r["Sélection"]
         )
     )
 
-    return results, future_count
+    return results, future_count, eligible_quotes
 
 
-target_text = st.text_input(
-    "Cote recherchée",
-    value="1.44",
-    help="Exemple : 1.44 ou 1,44"
-)
+with st.form("scanner_form"):
+    target_text = st.text_input(
+        "Cote recherchée",
+        value="1.66",
+        help="Exemple : 1.66 ou 1,66"
+    )
 
-if st.button(
-    "🔎 SCANNER",
-    use_container_width=True,
-    type="primary"
-):
+    mode = st.radio(
+        "Type de recherche",
+        ["Exacte", "Approximative (±0.01)"],
+        horizontal=True
+    )
+
+    period = st.selectbox(
+        "Matchs à rechercher",
+        [
+            "Aujourd'hui",
+            "Demain",
+            "Aujourd'hui et demain"
+        ]
+    )
+
+    scan = st.form_submit_button(
+        "🔎 SCANNER",
+        type="primary",
+        use_container_width=True
+    )
+
+
+if scan:
     target = decimal_odd(
         target_text.strip().replace(",", ".")
     )
 
     if target is None:
         st.error(
-            "Entre une cote décimale valide, par exemple 1.44."
+            "Entre une cote décimale valide, par exemple 1.66."
         )
     else:
-        with st.spinner("Recherche des matchs et des cotes..."):
+        target = rounded_odd(target)
+
+        tolerance = (
+            CENT
+            if mode.startswith("Approximative")
+            else Decimal("0.00")
+        )
+
+        if period == "Aujourd'hui et demain":
+            days = [0, 1]
+        elif period == "Demain":
+            days = [1]
+        else:
+            days = [0]
+
+        with st.spinner("Analyse des cotes en cours..."):
             try:
                 matches = fetch_matches()
-                results, future_count = scan_matches(
-                    matches, display_odd(target)
+
+                results, future_count, eligible_quotes = (
+                    scan_matches(
+                        matches,
+                        target,
+                        tolerance,
+                        days
+                    )
                 )
 
-                st.session_state["scan_results"] = results
-                st.session_state["future_count"] = future_count
-                st.session_state["scanned_odd"] = (
-                    f"{display_odd(target):.2f}"
-                )
-                st.session_state["scan_date"] = (
-                    datetime.now(TZ).date().isoformat()
-                )
-                st.session_state["result_page"] = 1
+                st.session_state["kairos_scan"] = {
+                    "results": results,
+                    "future_count": future_count,
+                    "eligible_quotes": eligible_quotes,
+                    "target": f"{target:.2f}",
+                    "mode": mode,
+                    "period": period,
+                    "timestamp": datetime.now(TZ).strftime(
+                        "%d/%m/%Y %H:%M"
+                    ),
+                }
+
+                st.session_state["kairos_page"] = 1
 
             except (requests.RequestException, ValueError) as exc:
                 st.error(
@@ -234,27 +285,29 @@ if st.button(
                 )
 
 
-if "scan_results" in st.session_state:
-    results = st.session_state["scan_results"]
+if "kairos_scan" in st.session_state:
+    scan_data = st.session_state["kairos_scan"]
+    results = scan_data["results"]
 
     st.success("Analyse terminée !")
 
-    col1, col2 = st.columns(2)
+    c1, c2 = st.columns(2)
 
-    col1.metric(
-        "Matchs à venir aujourd'hui",
-        st.session_state["future_count"]
+    c1.metric(
+        "Matchs à venir",
+        scan_data["future_count"]
     )
 
-    col2.metric(
+    c2.metric(
         "Correspondances",
         len(results)
     )
 
     st.caption(
-        f"Dernière recherche : "
-        f"{st.session_state['scanned_odd']} | "
-        f"Date : {st.session_state['scan_date']}"
+        f"Recherche {scan_data['mode'].lower()} | "
+        f"{scan_data['target']} | "
+        f"{scan_data['period']} | "
+        f"{scan_data['timestamp']} (QC)"
     )
 
     if results:
@@ -262,16 +315,13 @@ if "scan_results" in st.session_state:
             len(results) + PAGE_SIZE - 1
         ) // PAGE_SIZE
 
-        if st.session_state.get("result_page", 1) > total_pages:
-            st.session_state["result_page"] = 1
-
         page = st.selectbox(
             "Page de résultats",
-            options=list(range(1, total_pages + 1)),
-            key="result_page",
+            range(1, total_pages + 1),
+            key="kairos_page",
             format_func=lambda p: (
                 f"Page {p} / {total_pages}"
-            ),
+            )
         )
 
         start = (page - 1) * PAGE_SIZE
@@ -288,25 +338,30 @@ if "scan_results" in st.session_state:
 
                 st.caption(
                     f"🏆 {row['Ligue']} | "
+                    f"🗓️ {row['Date']} | "
                     f"🕒 {row['Heure (QC)']} (Québec)"
                 )
 
-                left, right = st.columns(
-                    [3, 1],
-                    vertical_alignment="center"
-                )
+                left, right = st.columns([3, 1])
 
                 with left:
                     st.markdown(
                         f"**{row['Sélection']}**"
                     )
+
                     st.caption(row["Marché"])
 
+                    if row["Correspondance"] == "Exacte":
+                        st.caption("🎯 Cote exacte")
+                    else:
+                        st.caption(
+                            "🔎 Cote proche "
+                            f"({row['Écart']} par rapport "
+                            "à la recherche)"
+                        )
+
                 with right:
-                    st.metric(
-                        "Cote",
-                        row["Cote"]
-                    )
+                    st.metric("Cote", row["Cote"])
 
         output = io.StringIO()
 
@@ -323,19 +378,25 @@ if "scan_results" in st.session_state:
             data="\ufeff" + output.getvalue(),
             file_name="kairos_scanner.csv",
             mime="text/csv",
-            use_container_width=True,
+            use_container_width=True
         )
 
     else:
         st.info(
-            "Aucune correspondance trouvée "
-            "pour cette cote aujourd'hui."
+            "Aucune cote correspondante "
+            "dans la période choisie."
         )
+
+    st.caption(
+        "Cotes Over/Under valides examinées : "
+        f"{scan_data['eligible_quotes']}"
+    )
 
 
 st.caption(
-    "Source : MoviOdds. Les cotes peuvent changer. "
-    "La provenance Bet365 et le statut pré-match "
-    "des cotes sans phase ne sont pas vérifiés. "
-    "Confirme chaque sélection manuellement."
+    "Source : MoviOdds. Les cotes et horaires peuvent "
+    "différer de Bet365. La provenance Bet365 et le "
+    "statut pré-match des cotes sans phase ne sont "
+    "pas vérifiés. Vérifie toujours le match, "
+    "la sélection, l'heure et la cote sur Bet365."
 )
